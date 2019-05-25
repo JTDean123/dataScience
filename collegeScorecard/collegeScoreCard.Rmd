@@ -1,0 +1,888 @@
+---
+title: "College Scorecard Data Analysis and GBM Model of Predictive Earnings"
+author: "Jason Dean"
+date: "March 14, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm( list = ls())  # Clear environment
+library(RSQLite)
+library(ggmap)
+library(dplyr)
+library(ggplot2)
+library(maps)
+library(knitr)
+library(gridExtra)
+library(gbm)
+library(caret)   
+set.seed(12345, "L'Ecuyer")
+```
+
+<br>
+ 
+### Introduction
+
+Whether or not to attend college is a question that millions of high school seniors face every year.  Those choosing to attend further have to decide between two and four year schools, courses of study, and how to deal with the financial aspect of paying for years of training. The government contributed over 100 billion dollars (1) in appropriations and grants to finance higher education, including financial aid packages.  Despite this, it seems that many students are leaving school with considerable amounts of student debt.  Because of the massive financial impact that secondary education has on the economy the government created a College Scoreboard 'to provide reliable and unbiased information about college performance' (1).  In the making of this College Scoreboard data was compiled from the last 20 years pertaining to student financial returns on their college investment.  This quite large data set (2) contains key metrics like admissions rates, post graduation earnings of graduates, and the demographics of the students attending a school. 
+
+In this analysis we evaluate the financial implications of attending a post secondary school.  Specifically, we analyze the cost and the earnings ten years after leaving a post secondary school to try to determine what factors most influence earnings after attending a post secondary institution.  Finally, we developed a supervised machine learning algorithm to predict future earnings based on an institution's features.
+
+(1) https://collegescorecard.ed.gov/assets/UsingFederalDataToMeasureAndImprovePerformance.pdf
+(2) https://collegescorecard.ed.gov/data/
+
+### Study Evaluation and Hypothesis
+
+The goal of this observational study was to increase transparency and help parents and students understand the cost of college versus the outcomes and returns for their post secondary investments (3).  The data (to be discussed in greater detail below) contains features such as:
+
+* highest degree awarded at an institution
+* admission rate
+* median debt of students that complete their education at a given institution
+
+The data were obtained from direct reporting from institutions, data pulled from federal financial aid, and tax information (3) and they are reported for every year between 1996 and 2016.  Before moving forward with analysis of this data set it is important to identify potential bias because this will influence what types of questions we can ask.  
+
+A major bias introduced in this study by the collectors of the data is that the data is limited to students that are Title IV recipients (3).  A Title IV award includes government loans and grants (4), and these are need based awards.  Thus, it is important to keep in mind that the conclusions we attempt to make using this data set are not general to all students, but rather only those that qualified for, or perhaps more importantly had access to, financial aid.  
+
+A second bias in this study is that it only pertains to schools that received financial aid.  Over 80% of schools receive financial aid (5), so this bias is not as severe as the one mentioned earlier.  However, moving forward we should remember that this data set is limited to students that received financial aid at a subset of available schools.
+
+(3) https://collegescorecard.ed.gov/assets/FullDataDocumentation.pdf
+(4) http://federalstudentaid.ed.gov/site/front2back/programs/programs/fb_03_01_0030.htm
+(5) https://nces.ed.gov/fastfacts/display.asp?id=31
+
+**The hypothesis for the study presented here is that a student's future earnings are maximized by attending the best school they can get into, despite the cost.** 
+
+A better school has:
+
+* a higher average SAT score for attending students  
+* more advanced degrees
+* high average faculty salaries
+* more selective admissions 
+
+**Here we will use the collegescorecard data set to make a data driven evalauation of this hypothesis.**
+
+### Importing Data to a SQLlite Database
+
+This publicly available data used for this study (2015-2016 year) is a relatively large data set containing 7703 observations and 1743 features, so it makes sense to organize it in a SQL database to increase query speed.  To do this we will use SQlite.  First the data, a csv file, was downloaded ('Most recent data') from the following source:  
+
+https://collegescorecard.ed.gov/data/
+
+Next, the data was loaded into a SQLite database.  It was found that SQLite will only accept 999 columns (features) at a time, which is a problem since there are 1743 columns in the data set, so we had to delete ones that are unlikely to be meaningful in this analysis.
+
+```{r echo=TRUE}
+# Create College Scorecard Database in RAM
+college.db <- dbConnect(SQLite(), dbname = ":memory:")
+dskdb <- dbConnect(SQLite(), dbname = "collegeScorecard.sqlite")
+sqliteCopyDatabase(dskdb, college.db)
+dbDisconnect(dskdb)
+
+# Add data tables to the DB
+college.data <- read.csv('rawData/MERGED2015_16_PP.csv', header=TRUE)
+college.data <- college.data[,-c(442:1350)]
+dbWriteTable(college.db, "collegeData", college.data)
+dbListTables(college.db)
+```
+
+The majority of the features that were excluded include the percentage of students that died subsetted into various criteria and data describing student transfers.  
+
+### Exploratory Data and Analysis
+
+Now that the data is loaded into a database table that we can query we can identify features that will be of interest moving forward:
+
+* STABBR -- the state location of the institution
+* COSTT4_A -- average cost of attendance
+* ADM_RATE -- admission rate
+* AVGFACSAL -- average faculty salary
+* SAT_AVG -- average SAT score of students admitted
+* ACTCMMID -- midpoint of the ACT average score 
+* GRAD_DEBT_MDN -- median debt of students that completed
+* WDRAW_DEBT_MDN -- median debt of students that did not complete
+* MD_EARN_WNE_P10 -- median earnings of students working and not enrolled ten years after enrolling
+
+There are three things to consider when evaluating the financial aspects of attending a college:
+
+1) the cost 
+2) the amount of debt to be taken on and 
+3) the future earnings.  
+
+Below we perform exploratory data analysis of these three aspects.
+
+<br>
+
+#### Cost of Attending College
+
+We will begin exploratory data analysis by evaluating the cost of attending post secondary schooling.  First, we look at the geographical location of the institutions included in the study.  
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull college cost and location data from the db and convert to numeric
+costLoc <- dbSendQuery(college.db, "SELECT COSTT4_A, LATITUDE, LONGITUDE FROM collegeData")
+costLoc <- fetch(costLoc)
+title <- c('AverageCost', 'LATITUDE', 'LONGITUDE')
+colnames(costLoc) <- title
+costLoc$AverageCost <- as.numeric(costLoc$AverageCost)
+costLoc$LATITUDE <- as.numeric(costLoc$LATITUDE)
+costLoc$LONGITUDE <- as.numeric(costLoc$LONGITUDE)
+
+# get a map of the USA from gogle
+map<-get_map(location='united states', zoom=4, maptype = "terrain", source='google',color='color')
+
+# plot the lat/long institution data over the google map
+ggmap(map, extent="device") + geom_point(aes(x=LONGITUDE, y=LATITUDE), data=costLoc, alpha=.25, na.rm = T, col="dodgerblue3") 
+```
+
+As shown above, we find that there is a high density of post secondary institutions in the NE portion of the country.  Also, we see that large cities like Los Angeles and San Francisco are dense with institutions.  We next identify the top ten most and least expensive post secondary institutions.  We start with the top-ten most expensive schools.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull average cost and name data from the db
+costNames <- dbSendQuery(college.db, "SELECT COSTT4_A as [AverageCost], INSTNM as [Name] FROM collegeData")
+costNames <- fetch(costNames)
+costNames$AverageCost <- as.numeric(costNames$AverageCost)
+
+# plot the name and cost data for the top ten most expensive schools
+costNames <- costNames[order(costNames$AverageCost, decreasing = TRUE),]
+pricey <- costNames[1:10,]
+pricey$Name <- factor(pricey$Name, levels=pricey$Name)
+ggplot(pricey, aes(x=Name, y=AverageCost)) + geom_bar(stat = "identity", fill='lightblue', colour='black') + coord_flip() + ggtitle("Top Ten Most Expensive Schools") + xlab('')
+```
+
+And the top ten cheapest schools.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# plot the name and cost data for the top ten least expensive schools
+costNames <- costNames[order(costNames$AverageCost, decreasing = FALSE),]
+notpricey <- costNames[1:10,]
+notpricey$Name <- factor(notpricey$Name, levels=notpricey$Name)
+ggplot(notpricey, aes(x=Name, y=AverageCost)) + geom_bar(stat = "identity", fill='lightblue', colour='black') + coord_flip() + ggtitle("Top Ten Cheapest Schools") + xlab('')
+```
+
+Puerto Rico has very affordable schooling, it seems.  Next we examine the average cost of attending post secondary schools by state.
+
+```{r echo=TRUE, warning=FALSE}
+# pull average cost and state data from the db
+costState <- dbSendQuery(college.db, "SELECT AVG(COSTT4_A), STABBR FROM collegeData GROUP BY STABBR")
+costState <- fetch(costState)
+costState <- costState[order(costState$`AVG(COSTT4_A)`),]
+
+# summary statistics for the average cost of attendence
+summary(costState$`AVG(COSTT4_A)`)
+```
+
+The mean is approximately equal to the median, indicating that there is not significant skew in the data.  We can next visualize the average cost of attending post secondary institutions by state map format.  
+
+```{r echo=TRUE}
+# convert state abbreviations to full names and plot the average cost over the google USA map
+st.codes<-data.frame(state=as.factor(c("AK", "AL", "AR", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA","HI", "IA", "ID", "IL", "IN", "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MS",  "MT", "NC", "ND", "NE", "NH", "NJ", "NM", "NV", "NY", "OH", "OK", "OR", "PA", "PR", "RI", "SC", "SD", "TN", "TX", "UT", "VA", "VT", "WA", "WI", "WV", "WY")), full=as.factor(c("alaska","alabama","arkansas","arizona","california","colorado", "connecticut","district of columbia","delaware","florida","georgia", "hawaii", "iowa","idaho", "illinois", "indiana", "kansas", "kentucky", "louisiana","massachusetts","maryland","maine","michigan","minnesota","missouri","mississippi","montana","north carolina","north dakota", "nebraska","new hampshire","new jersey", "new mexico","nevada", "new york","ohio","oklahoma","oregon","pennsylvania","puerto rico", "rhode island","south carolina","south dakota","tennessee","texas",  "utah",  "virginia", "vermont", "washington", "wisconsin", "west virginia", "wyoming")))
+
+costState$region <- st.codes$full[match(costState$STABBR, st.codes$state)]
+states <- map_data("state")
+map.df <- merge(states,costState, by="region", all.x=T)
+map.df <- map.df[order(map.df$order),]
+map.df$AverageCost <- map.df$`AVG(COSTT4_A)`
+
+ggplot(map.df, aes(x=long,y=lat,group=group)) + geom_polygon(aes(fill=AverageCost)) + geom_path()+ scale_fill_gradientn(colours=rev(heat.colors(10)),na.value="grey90") + coord_map()
+```
+
+It appears there is one state that is quite a bit more expensive than the rest - Vermont! It seems that post secondary education costs more, on average, on the East Coast.  Interestingly, Nebraska and Iowa are more expensive, on average, than their surrounding states.  
+
+We next examine the relationship between cost and admission rate, faculty salary, and SAT score.
+
+```{r echo=TRUE, warning=FALSE}
+# pull cost, admission rate, average faculty salary, and average incoming SAT score from the DB
+costAux <- dbSendQuery(college.db, "SELECT COSTT4_A, ADM_RATE, AVGFACSAL, SAT_AVG FROM collegeData")
+costAux  <- fetch(costAux)
+title <- c("AverageCost", "AdmissionRate", "FacultySalary", "AverageSAT")
+colnames(costAux) <- title
+
+# remove NULL and NA containing entries and convert to numerics
+costAux <- costAux[costAux$AverageCost != 'NULL',]
+costAux <- costAux[costAux$AverageCost != 'NA',]
+costAux <- costAux[costAux$FacultySalary != 'NULL',]
+costAux <- costAux[costAux$FacultySalary != 'NA',]
+costAux <- costAux[costAux$AdmissionRate != 'NULL',]
+costAux <- costAux[costAux$AdmissionRate != 'NA',]
+costAux <- costAux[costAux$AverageSAT != 'NULL',]
+costAux <- costAux[costAux$AverageSAT != 'NA',]
+
+costAux$AverageCost <- as.numeric(costAux$AverageCost)
+costAux$FacultySalary <- as.numeric(costAux$FacultySalary)
+costAux$AdmissionRate <- as.numeric(costAux$AdmissionRate)
+costAux$AverageSAT <- as.numeric(costAux$AverageSAT)
+```
+
+Now that entries with missing data have been removed, we can plot the AverageCost versus FacultySalary.
+
+```{r echo=TRUE}
+# plot average cost of attendance vs. average faculty salary
+ggplot(costAux, aes(x=AverageCost, y=FacultySalary)) + geom_point(alpha=0.5) + theme_bw() + geom_smooth(method=lm, se=FALSE) + ggtitle("Faculty Salary vs. Average Cost")
+```
+
+The first thing that stands out in this plot is the low average salaries that college professors earn.  It is possible that many of them are part time?  Also, it appears that there are two unique groups in this data.  There appears to be a positive linear relationship between AverageCost and FacutlySalary for Institutions with an AverageCost > 20000, and another weaker positive linear relationship between these two features for Average Cost < 20000.  In general, we can say that more expensive schools pay their Faculty a higher wage.
+
+```{r echo=TRUE}
+# plot average cost of attendance vs. admission rate
+ggplot(costAux, aes(x=AverageCost, y=AdmissionRate)) + geom_point(alpha=0.5) + theme_bw() + geom_smooth(method=lm, se=FALSE) + ggtitle("Admission Rate vs. Average Cost")
+```
+
+In contrast to FacultySalary, we see a relatively weak negative linear relationship between AdmissionRate and AverageCost that seems to be driven by the cluster of institutions with a less than 20% admission rate and cost of greater than 60,000.  Assesment of the strength of this relationship could be done by evaluating the p-value of the slope of the regression line, but this is beyone the scope of this EDA.
+
+```{r echo=TRUE}
+# plot average SAT score vs. admission rate
+ggplot(costAux, aes(x=AverageCost, y=AverageSAT)) + geom_point(alpha=0.5) + theme_bw() + geom_smooth(method=lm, se=FALSE) + ggtitle("Average SAT vs. Average Cost")
+```
+
+Finally, we see a postive linear relationship between the AverageSAT score and the AverageCost, indicating that more selective schools that take students with higher SAT scores charge their students a higher cost.  
+
+
+**Cost of Attending College - Conclusions:**
+
+Post secondary education cost varies by state, and expect to pay more at schools where faculty get paid more and at schools where the average SAT is higher.
+
+<br>
+
+#### Debt Accrued From Attending College
+
+Another major financial aspect of attending a post secondary school is the debt that often comes with it. Taking on debt can be a wise financial move it the returns are greater, and we will get to this analysis below, but first we explore the debt in this data set. There are two debt features to consider:  
+
+* GRAD_DEBT_MDN -- median debt of students that completed
+* WDRAW_DEBT_MDN -- median debt of students that did not complete
+
+First we find the top ten schools where students that finish their schooling have the most debt.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull debt data from collegeData database
+debtName <- dbSendQuery(college.db, "SELECT GRAD_DEBT_MDN as [completeDebt], INSTNM as [Name] FROM collegeData")
+debtName <- fetch(debtName)
+debtName$completeDebt <- as.numeric(debtName$completeDebt)
+
+# plot the schools with the highest associated debt
+debtName <- debtName[order(debtName$completeDebt, decreasing = TRUE),]
+pricey <- debtName[1:10,]
+pricey$Name <- factor(pricey$Name, levels=pricey$Name)
+ggplot(pricey, aes(x=Name, y=completeDebt)) + geom_bar(stat = "identity", fill='lightblue', colour='black') + coord_flip() + ggtitle("Top Ten Schools For Most Debt") + xlab('')
+```
+
+Interestingly, we find that many of the schools associated with high debt are visual arts and design institutions.  Next, we determine if there is a difference in debt between students that complete and students that withdraw.  First, we extract this data from the collegeData database and plot the debt for the two groups of students in a histogram.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull debt data from collegeData database, remove missing values, and convert to numeric
+debtLoc <- dbSendQuery(college.db, "SELECT GRAD_DEBT_MDN, WDRAW_DEBT_MDN FROM collegeData")
+debtLoc <- fetch(debtLoc)
+title <- c('completeDebt', 'wdrawDebt')
+colnames(debtLoc) <- title
+debtLoc$completeDebt <- as.numeric(debtLoc$completeDebt)
+debtLoc$wdrawDebt <- as.numeric(debtLoc$wdrawDebt)
+debtLoc <- debtLoc[!is.na(debtLoc$completeDebt),]
+debtLoc <- debtLoc[!is.na(debtLoc$wdrawDebt),]
+summary(debtLoc)
+
+# format data for plotting and plot debt of those that withdraw and those that complete their education
+finishDebt <- as.data.frame(debtLoc$completeDebt)
+finishDebt$type <- 'complete'
+withdrawDebt <- as.data.frame(debtLoc$wdrawDebt)
+withdrawDebt$type <- 'withdraw'
+names <- c('debt', 'type')
+colnames(finishDebt) <- names
+colnames(withdrawDebt) <- names
+debt <- rbind(withdrawDebt, finishDebt)
+ggplot(debt, aes(debt, fill=type)) + geom_density(alpha=0.5, aes(y=..scaled..))
+```
+
+As shown above, we find that the median and mean debt of those completing their education are over double than those that withdraw.  However, more interestingly, we find that the populations for both groups appear to have a multimodal distribution.  I suspect that the distribution of debt for these groups is not in fact multimodal, but rather the samples are drawn from two distinct normal populations.  It is reasonable to speculate that attending private school results in more debt than attending a public institution, so we first evaluate if this explains the multimodal distribution seen above.  Information regarding whether an institution is public or private is contained in the following feature:
+
+* CONTROL:
+* 1	Public
+* 2	Private nonprofit
+* 3	Private for-profit
+
+We can look at the debt for those that withdraw and those that complete their education based on the three groups in CONTROL.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull data and intstitution type from collegeData database, convert to numeric, and remove missing data
+debtPP <- dbSendQuery(college.db, "SELECT GRAD_DEBT_MDN, WDRAW_DEBT_MDN, CONTROL FROM collegeData")
+debtPP <- fetch(debtPP)
+title <- c('completeDebt', 'wdrawDebt', 'prvtPublic')
+colnames(debtPP) <- title
+debtPP$completeDebt <- as.numeric(debtPP$completeDebt)
+debtPP$wdrawDebt <- as.numeric(debtPP$wdrawDebt)
+debtPP <- debtPP[!is.na(debtPP$completeDebt),]
+debtPP <- debtPP[!is.na(debtPP$wdrawDebt),]
+debtPP <- debtPP[!is.na(debtPP$prvtPublic),]
+
+# calculate the mean debt for the different type of institutions
+names <- data.frame(num = c(1,2,3), type = c("public", "private nonprofit", "private for-profit"))
+debtPP$prvtPublic <- as.numeric(debtPP$prvtPublic)
+debtPP$type <- names$type[match(debtPP$prvtPublic, names$num)]
+tabl <- debtPP %>% group_by(type) %>% summarise(completeDebt = mean(completeDebt), wdrawDebt = mean(wdrawDebt))
+kable(tabl, format="html", align = 'c')
+```
+
+<br>
+
+We find that the mean debt for those that complete their schooling is similar for those that attend private for-profit and public schools, but significantly higher for private nonprofit schools and the same is true for the debt taken on for those that withdraw before completing their education.  We can now group students into two groups - those that attended private for-profit or public schools and those that attended private non-profit schooling, and plot the histograms.
+
+```{r echo=TRUE}
+# create two separate dfs - one for containing data for private non-profit schools and one for the other two types
+names$num <- c("public / private for-profit", "private nonprofit", "public / private for-profit")
+debtPP$type <- names$num[match(debtPP$type, names$type)]
+debtPP.ppfp <- debtPP %>% filter(debtPP$type == 'public / private for-profit')
+debtPP.pnp <- debtPP %>% filter(debtPP$type == 'private nonprofit')
+
+# format data for plotting for public / private for-profit debt and plot
+finishDebt.ppfp <- as.data.frame(debtPP.ppfp$completeDebt)
+finishDebt.ppfp$type <- 'complete'
+withdrawDebt.ppfp <- as.data.frame(debtPP.ppfp$wdrawDebt)
+withdrawDebt.ppfp$type <- 'withdraw'
+names <- c('debt', 'type')
+colnames(finishDebt.ppfp) <- names
+colnames(withdrawDebt.ppfp) <- names
+debt.ppfp <- rbind(finishDebt.ppfp, withdrawDebt.ppfp)
+ggplot(debt.ppfp, aes(debt, fill=type)) + geom_density(alpha=0.5, aes(y=..scaled..)) + ggtitle('Debt:  Public and Private for-profit Institutions')
+
+# format data for plotting for Private non-profit debt and plot
+finishDebt.pnp <- as.data.frame(debtPP.pnp$completeDebt)
+finishDebt.pnp$type <- 'complete'
+withdrawDebt.pnp <- as.data.frame(debtPP.pnp$wdrawDebt)
+withdrawDebt.pnp$type <- 'withdraw'
+names <- c('debt', 'type')
+colnames(finishDebt.pnp) <- names
+colnames(withdrawDebt.pnp) <- names
+debt.pnp <- rbind(finishDebt.pnp, withdrawDebt.pnp)
+ggplot(debt.pnp, aes(debt, fill=type)) + geom_density(alpha=0.5, aes(y=..scaled..)) + ggtitle('Debt:  Private non-profit')
+```
+
+By grouping the debt of those that either completed or withdrew from their post secondary schooling by the type of institution (private non profit vs. public and private-for profit) we find that:
+
+**For private non-profit institutions:**   the debt distributions of those that complete their education and those that withdraw are approximately normally distributed and the debt of those that complete is over double that of those that withdraw.  
+
+**For public and private for-profit institutions**: the debt distributions are not normally distributed, however the debt of those that complete their education is much greater than those that withdraw
+
+Next, we determine the relationship between the debt taken on by those that finish their post secondary education and the cost of the institution.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull debt and cost data from collegeData database
+debtCost <- dbSendQuery(college.db, "SELECT GRAD_DEBT_MDN, COSTT4_A FROM collegeData")
+debtCost <- fetch(debtCost)
+title <- c('completeDebt', 'AverageCost')
+colnames(debtCost) <- title
+debtCost$completeDebt <- as.numeric(debtCost$completeDebt)
+debtCost$AverageCost <- as.numeric(debtCost$AverageCost)
+debtCost <- debtCost[!is.na(debtCost$completeDebt),]
+debtCost <- debtCost[!is.na(debtCost$AverageCost),]
+
+# plot completed debt vs cost
+ggplot(debtCost, aes(x=AverageCost, y=completeDebt)) + geom_point(alpha=0.5) + theme_bw() + geom_smooth(method=lm, se=FALSE)
+```
+
+It appears there is a linear relationship between the debt taken on by the students that complete their education for institutions that have an AverageCost < ~25,000, however, there is not a linear relationship for the higher priced institutions.  There seems to be quite a large amount of debt values equal to 27,500, and it is possible that this is the maximum debt allowed under certain cirucumstances?  If so, this would confound the analysis in the plot presented above.  
+
+**Debt Accrued From Attending College - Conclusions:**
+
+A student's debt will likely be higher if they complete their education, and it will be higher, on average, if they attend a private non-profit school.  It will also be higher if they attend a more expensive school.  
+
+<br>
+
+#### Future Earnings
+
+Perhaps the most important thing to consider when evaluating whether or not to invest in a post secondary education is the potential return on the investment.  We can measure this return by evaluating how much money students earn ten years after enrolling.  This metric is found in the feature:
+
+* MD_EARN_WNE_P10 -- Median earnings of students working and not enrolled ten years after enrolling
+
+First we find the schools that produce the top ten median earnings for their students.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull median earnings and name data from collegeData database
+earnName <- dbSendQuery(college.db, "SELECT MD_EARN_WNE_P10 as [medianEarnings], INSTNM as [Name] FROM collegeData")
+earnName <- fetch(earnName)
+earnName$medianEarnings <- as.numeric(earnName$medianEarnings)
+
+# plot earnings data for those that completed their education
+earnName <- earnName[order(earnName$medianEarnings, decreasing = TRUE),]
+rich <- earnName[1:10,]
+rich$Name <- factor(rich$Name, levels=rich$Name)
+ggplot(rich, aes(x=Name, y=medianEarnings)) + geom_bar(stat = "identity", fill='lightblue', colour='black') + coord_flip() + ggtitle("Top Ten Highest 10yr Median Earnings") + xlab('')
+```
+
+Not suprisingly, the top ten schools for median earnings ten years later are medical institutions.
+
+Next we determine earnings of students not enrolled ten years after enrolling by state.  Keep in mind this is not the earnings in the given state, but rather the earnings of students that attend an institution a given state.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull median earnings and state data from the db
+earnState <- dbSendQuery(college.db, "SELECT AVG(MD_EARN_WNE_P10), STABBR FROM collegeData GROUP BY STABBR")
+earnState <- fetch(earnState)
+title <- c('medianEarnings', 'State')
+colnames(earnState) <- title
+earnState$medianEarnings <- as.numeric(earnState$medianEarnings)
+
+# convert state abbreviations to full names and plot the median earnings over the google USA map
+earnState$region <- st.codes$full[match(earnState$State, st.codes$state)]
+states <- map_data("state")
+map.df <- merge(states,earnState, by="region", all.x=T)
+map.df <- map.df[order(map.df$order),]
+
+ggplot(map.df, aes(x=long,y=lat,group=group)) + geom_polygon(aes(fill=medianEarnings)) + geom_path()+ scale_fill_gradientn(colours=rev(heat.colors(10)),na.value="grey90") + coord_map()
+
+```
+
+We find that the median earnings ten years after leaving an institution are highest for WA, the upper mid-west, and the NE.  The highest - Nebraska!  The lowest- Idaho.
+
+We next investigate how the median earnings are related to the cost of attending an institutions.  
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull median earnings and cost data from the db
+earnState <- dbSendQuery(college.db, "SELECT MD_EARN_WNE_P10, COSTT4_A FROM collegeData")
+earnState <- fetch(earnState)
+title <- c('medianEarnings', 'AverageCost')
+colnames(earnState) <- title
+earnState$medianEarnings <- as.numeric(earnState$medianEarnings)
+earnState$AverageCost <- as.numeric(earnState$AverageCost)
+earnState <- earnState[!is.na(earnState$medianEarnings),]
+earnState <- earnState[!is.na(earnState$AverageCost),]
+
+# plot the median earnings vs. the cost of attending
+ggplot(earnState, aes(x=AverageCost, y=medianEarnings)) + geom_point(alpha=0.5) + theme_bw() + geom_smooth(method=lm, SE=TRUE) + ylim(0,75000)
+```
+
+It appears there is a linear relationship between the cost of an institution and the future earnings of the students, although there are significant outliers.  We can further quantify this relationship by creating a linear regression model:
+
+```{r echo=TRUE}
+# create a linear regression model of future earnings and average cost
+earnings <- lm(medianEarnings ~ AverageCost, data=earnState)
+
+# plot residuals of the linear regression model
+hist(earnings$residuals, breaks=50)
+qqnorm(earnings$residuals)
+qqline(earnings$residuals)
+```
+
+We find that the residuals are not normally distributed.  Specifically, there is a strong right skew.  We will try to log transform the data.
+
+```{r echo=TRUE}
+# create a linear regression of log(median earnings) vs cost of attendance 
+earnState$log <- log(earnState$medianEarnings)
+earnings <- lm(log ~ AverageCost, data=earnState)
+
+# plot residuals
+hist(earnings$residuals, breaks=50)
+qqnorm(earnings$residuals)
+qqline(earnings$residuals)
+```
+
+A log transformation of the medianEarnings data resulted linear regression residuals that much more closely met the criteria for a normal distribution.  We can now examine model coefficients.
+
+```{r echo=TRUE}
+# summary of linear model
+summary(earnings)
+```
+
+We find a statistically significant relationship between the log(medianEarnings) and AverageCost, indicating that more pricey institutions yield students with higher wages.  The R-squared value, 0.28, indicates that 28% of the variance observed in the response variable (log(MediaEarnings)) is explained by the explanatory variable (AverageCost)
+
+Institutions that offer more advanced degree programs may produce students that earn higher wages.  We can determine if this is true by investigating the relationship between the highest degree offered at an institution and the median earnings.  The following variable will be necessary for this:
+
+* HIGHDEG -- Highest degree awarded
+
+This feature is organized as follows:
+
+0 Non-degree-granting,
+1 Certificate degree,
+2 Associate degree,
+3 Bachelor's degree,
+4 Graduate degree.
+
+We start by pulling the degree information from the database and plotting the average median earnings according to the highest degree offered by an institution.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull median earnings and highest offered degree data and degree from the db
+earnDegree <- dbSendQuery(college.db, "SELECT AVG(MD_EARN_WNE_P10) as [medianEarnings], HIGHDEG FROM collegeData GROUP BY HIGHDEG")
+earnDegree <- fetch(earnDegree)
+earnDegree$type <- c("Non-degree-granting", "Certificate degree", "Associate degree", "Bachelor's degree", "Graduate Degree")
+earnDegree$medianEarnings <- as.numeric(earnDegree$medianEarnings)
+earnDegree$type <- factor(earnDegree$type, levels=earnDegree$type)
+
+# plot average median earnings grouped by highest offered degree
+ggplot(data=earnDegree, aes(x=type, y=medianEarnings)) + geom_bar(stat = "identity", fill='lightblue', colour='black') + xlab("Degree Type") + ylab("Average Median Earnings") + theme_bw()
+ 
+```
+
+As shown above we find that there is a strong relationship between the type of degree offered and the median future earnings of the students.  Specifically, students graduating from an institution that offers a graduate degree make, on average, nearly three times more ten years after graduation compared to those that attend an institution where the highest degree is a certificate.  
+
+Finally, an important question is whether taking on debt results in an increase in future earnings.  To determine this, we plot log(medianEarnings) versus the average debt of those that complete their program.
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+# pull median earnings and completeDebt from the db
+earnDebt <- dbSendQuery(college.db, "SELECT MD_EARN_WNE_P10 as [medianEarnings], GRAD_DEBT_MDN as [completeDebt] FROM collegeData")
+earnDebt <- fetch(earnDebt)
+earnDebt$medianEarnings <- as.numeric(earnDebt$medianEarnings)
+earnDebt$completeDebt <- as.numeric(earnDebt$completeDebt)
+earnDebt <- earnDebt[!is.na(earnDebt$medianEarnings),]
+earnDebt <- earnDebt[!is.na(earnDebt$completeDebt),]
+earnDebt$log <- log(earnDebt$medianEarnings)
+
+# plot the median earnings vs. complete debt
+ggplot(earnDebt, aes(x=completeDebt, y=log)) + geom_point(alpha=0.5) + theme_bw() + geom_smooth(method=lm, SE=FALSE) + ylab("log Median Earnings")
+```
+
+It appears there is a weak linear relationship between the log(medianEarnings) and the debt of those that complete their degree.  
+
+```{r echo=TRUE}
+# evaluate linear relationship between log(medianEarnings) and completeDebt
+fit <- lm(log ~ completeDebt, earnDebt)
+hist(fit$residuals,breaks=50)
+qqnorm(fit$residuals)
+qqline(fit$residuals)
+summary(fit)
+```
+
+We find that 26% of the variance in log (medianEarnings) is attributed to the amount of debt accumulated by those that finish their program.  This means if you take on more debt, you will likely earn more money.  However, it is likely that debt and the cost of attendance are collinear, so the absolute value of R-squared for this model may be misleading.
+
+Finally we examine the relationship between AverageSAT score, the Admission Rate, and the Average Faculty Salary vs Median Earnings.
+
+```{r echo=TRUE, warning=FALSE}
+# pull admission rate, average SAT score, median wage, and average faculty salary from the DB
+costSmarts <- dbSendQuery(college.db, "SELECT ADM_RATE as [AdmissionRate], SAT_AVG as [AverageSAT], MD_EARN_WNE_P10 as [MedianEarnings], AVGFACSAL as [avgFacultySalary] FROM collegeData")
+costSmarts  <- fetch(costSmarts)
+
+# remove NULL and NA containing entries and convert to numeric
+costSmarts <- costSmarts[costSmarts$AdmissionRate != 'NULL',]
+costSmarts <- costSmarts[costSmarts$AdmissionRate != 'NA',]
+costSmarts <- costSmarts[costSmarts$AverageSAT != 'NULL',]
+costSmarts <- costSmarts[costSmarts$AverageSAT != 'NA',]
+costSmarts <- costSmarts[costSmarts$MedianEarnings != 'NULL',]
+costSmarts <- costSmarts[costSmarts$MedianEarnings != 'NA',]
+costSmarts <- costSmarts[costSmarts$avgFacultySalary != 'NULL',]
+costSmarts <- costSmarts[costSmarts$avgFacultySalary != 'NA',]
+
+costSmarts$AdmissionRate <- as.numeric(costSmarts$AdmissionRate)
+costSmarts$MedianEarnings <- as.numeric(costSmarts$MedianEarnings)
+costSmarts$AverageSAT <- as.numeric(costSmarts$AverageSAT)
+costSmarts$avgFacultySalary <- as.numeric(costSmarts$avgFacultySalary)
+
+# plot the data
+ggplot(costSmarts, aes(x=MedianEarnings, y=AdmissionRate)) + geom_point(alpha=0.5) + theme_bw() + geom_smooth(method=lm, SE=FALSE) + ggtitle('Admission Rate vs. Median Earnings')
+
+ggplot(costSmarts, aes(x=MedianEarnings, y=AverageSAT)) + geom_point(alpha=0.5) + theme_bw() + geom_smooth(method=lm, SE=FALSE) + ggtitle('Average SAT vs. Median Earnings')
+
+ggplot(costSmarts, aes(x=MedianEarnings, y=avgFacultySalary)) + geom_point(alpha=0.5) + theme_bw() + geom_smooth(method=lm, SE=FALSE) + ggtitle('Average Faculty Salary vs. Median Earnings')
+```
+
+We find a weak negative linear relationship between Admission rate and MedianEarnings, indicating that there may be a financial advantage to attending more selective schools.  More significantly, however, we find a strong positive relationship between AverageSAT score and Median Earnings.  We also find a strong positive relationship between Faculty Salary and Median Earnings.  
+
+**Future Earnings - Conclusions:**
+
+In conclusion, we find the median earnings of students ten years post attending an institution varies significantly by state.  Furthermore, there is a positive linear relationship between the cost of the institution and the future earnings, so more expensive schools may be worth it.  Finally, the more advanced degree a school offers the more money a student is likely to make.  Additionally, attending an institution with the highest AverageSAT score may be a strategy to maximize your earning potential.
+
+<br>
+
+### Hypothesis Evaluation
+
+As stated above, the hyothesis for this study was:
+
+**The hypothesis for the study presented here is that a student's future earnings are maximized by attending the best school they can get into, despite the cost.** 
+
+A better school has:
+
+* a higher average SAT score for attending students  
+* more advanced degrees
+* high average faculty salaries
+* more selective admissions 
+
+After collecting and analyzing data from the college scorecard we are in a position to evaluate this hypothesis.  We found that insitutions with high average faculty salaries and high average SAT scores cost more, but students that attend these schools make more money ten years after leaving the institution.  Additionally, schools that offer more advanced degrees, such as bachelors and graduate degrees, produce students that make higher wages.  We also found a statistically significant positive correlation between the cost of attending the institution and the median student salary ten years after leaving, indicating that post secondary schooling is a good investment. However, we did not find a strong correlation between admission rate and future earnings, indicating that difficulty of gaining entry to a school should not be a metric when determining where to obtain post secondary schooling.  
+
+A potential caveat in this study is that we are assessing an institution's profile for the 2015-2016 year, however we are evaluating this data against the median salary ten year after enrolling in the institution and obviously we do not know the median salary for an institution for 2025.  This means that the average SAT score, for example, is not necessarily the SAT score of the incoming class that earns the reported median salary.  It is uncertain how much an average SAT score will change for an institution over a ten year period, and it is even more unclear how one would assess this since there will be many confounding variables influencing SAT scores.  So, for the sake of generating data that is most relevant (telling a high school senior the average SAT score of a college ten year ago is not very informative) we analyzed the data without considering this caveat.  It is also likely that the large number of data points in the study make this point insignificant.  
+
+In conclusion, we found that most of our hypothesis is supported by the data in this study.  We suggest that post secondary education is a good investment, and it makes sense to attend the best institution possible if the goal is maximum salary ten years after leaving.  However, it is important to note that this will not be every students goal, and many other factors will and should influence where to attend post secondary schooling.  
+
+
+### Predicting Future Earnings
+
+Now that we have identified the features that are related to the median earnings of students ten years after attending an institution we are in a position to build a supervised regression machine learning model to predict future earnings. 
+
+As mentioned above, features that seem to influence future earnings are the following:
+
+* HIGHDEG -- Highest degree awarded
+* STABBR -- the state location of the institution
+* COSTT4_A -- average cost of attendance
+* AVGFACSAL -- average faculty salary
+* SAT_AVG -- average SAT score of students admitted
+
+Two of the features are categorical and three are continous, and a decision tree model is suited to handing these types of features for regression.  Furthermore, we will attempt to improve model perforance by employing a gradient boost model.  Here we breifly describe  gradient boosting for supervised regression.  
+
+The goal of supervised learning is to find a function that maps a set of input features (x) to a desired output response variable (y).  More formally, given a set of feature vectors:
+
+$\begin{align*}
+(x_1, y_1), (x_2, y_2), ... (x_n, y_n)
+\end{align*}$
+
+Find a function $\begin{align*} F(x) = y \end{align*}$ that minimizes a loss function $\begin{align*} L(y, F(x)) \end{align*}$.  Our model, $\begin{align*} F(x) \end{align*}$, will not fit the response variable perfectly, and we can capture deviations from the actual and predicted values of the response variable with a function $\begin{align*} h(x) \end{align*}$ such that:
+
+$\begin{align*}
+F(x) + h(x) = y \\
+\\
+h(x) = F(x) - y
+\end{align*}$
+
+As shown above, the residuals (contained in $\begin{align*} h(x) \end{align*}$) are the difference between the predicted and actual values of the output variable.  In gradient boosting we attempt to improve the initial model by incorporating an additional model of the residuals.  In this way, we can build a model in a stagewise manner where each stage introduces a weak learner that models the residuls, and the final model is simply a linear combination of the weak learners.  This can be expressed as:
+
+$\begin{align*}
+F_1(x) + h_1(x) = y
+\end{align*}$
+
+$\begin{align*}
+h_1(x) = F_2(x) + h_2(x)
+\end{align*}$
+
+$\begin{align*}
+h_2(x) = F_3(x) + h_3(x) 
+\end{align*}$
+
+$\begin{align*}
+.\\
+.\\
+.\\
+\end{align*}$
+
+$\begin{align*}
+h_{n-1}(x) = F_n(x) + h_n(x)
+\end{align*}$
+
+<br>
+
+We can now express this model as a linear combination of weak learners as:
+
+
+$\begin{align*}
+F(x, \beta) = \sum_{i=1}^{n}\beta_ih(x)
+\end{align*}$
+
+
+Now, how is this related to gradient descent?  The principle of gradient descent is that the local minimum of a function can be found by taking steps that are proportional to the negative of the gradient (derivative) of the function at the current point.  As mentioned above, a supervised machine learning model is generated by finding a function that minimizes a loss function.  Consider the popular regession  mean squared error loss function assuming the gaussian distribution:
+
+$\begin{align*}
+loss = \sum_{i=1}^{n}(y_i - F(x_i))^2
+\end{align*}$
+
+Thus, we can find a local minimum for the loss function by moving against the gradient, or:
+
+$\begin{align*}
+-\frac{d(loss)}{d(F(x_i))} =  F(x_i) - y_i
+\end{align*}$
+
+<br>
+
+This result is significant, becuase the negative gradient of this loss function is equal to the residuals.  This means that by introducing weak learners that fit the residuals we are essentially moving to a local mininum of the loss function.  This stratety can be applied to any differentiable loss function and also to any learner, although decision trees are most often used.  
+
+#### Model1
+
+We are now in a position to created a gradient boosted decision tree model to predict ten year median earnings.  First, we pull the appropriate data from the college database.
+
+```{r echo=TRUE, warning=FALSE}
+# pull earnings data from the database for model building
+earnings <- dbSendQuery(college.db, "SELECT HIGHDEG as [highestDegree], STABBR as [state], COSTT4_A as [averageCost], AVGFACSAL as [avgFacultySalary], SAT_AVG as [AverageSAT], MD_EARN_WNE_P10 as [MedianEarnings] FROM collegeData")
+earnings  <- fetch(earnings)
+
+# format as numeric
+earnings$averageCost <- as.numeric(earnings$averageCost)
+earnings$avgFacultySalary <- as.numeric(earnings$avgFacultySalary)
+earnings$AverageSAT <- as.numeric(earnings$AverageSAT)
+earnings$MedianEarnings <- as.numeric(earnings$MedianEarnings)
+earnings$state <- as.factor(earnings$state)
+earnings$highestDegree <- as.numeric(earnings$highestDegree)
+
+# convert 'highest degree' number to name
+degrees <- data.frame(number = c(0,1,2,3,4), type = c("Non-degree-granting", "Certificate degree", "Associate degree", "Bachelor's degree", "Graduate Degree"))
+earnings$highestDegree <- degrees$type[match(earnings$highestDegree, degrees$number)]
+earnings$highestDegree <- as.factor(earnings$highestDegree)
+
+# remove missing data
+earnings <- earnings[complete.cases(earnings),]
+```
+
+Now that we have the data formatted properly we can split the data into training and test sets.
+
+```{r echo=TRUE, warning=FALSE}
+# split data into test and training sets
+splitter <- sample(c("train", "test"), nrow(earnings), replace=TRUE, prob=c(0.7,0.3))
+earnings.train <- earnings[splitter == 'train',]
+earnings.test <- earnings[splitter == 'test',]
+```
+
+We are now prepared to perform hyperparameter tuning to determine the best parameters for a gradient boost model.  There are four parameters that are important for gradient boosted model building:  the minimum number of observations in a terminal node, the number of trees, interaction depth, and shrinkage.
+
+* n.minobsinnode - mininum number of trees in a terminal node
+* n.trees - the number of trees in the model (i.e. the number of gradient boosting iterations)
+* shrinkage - reduces the impact of each tree and prevents the model from taking steps that are too large
+* interaction.depth - the number of splits on a tree starting from a single node
+
+We will hyperparameter tune by performing the computationally expensive grid search technique.  We create a grid as follows:
+
+```{r echo=TRUE}
+# create a grid of gradient boost hyperparameters
+grid = expand.grid(.n.trees=seq(1,201, by=20), .interaction.depth=seq(1,4, by=1), .shrinkage=c(.001,.01,.1), .n.minobsinnode=10)
+```
+
+Next we create a control object for the training model using the 'leave one out cross validation' method and create a model using the training data.
+
+```{r echo=TRUE, eval=FALSE}
+# create control object for training and hyperparameter tune using the training data
+control = trainControl(method="LOOCV")
+earnings.gbm.train = train(MedianEarnings~., data=earnings.train, method="gbm", trControl=control, tuneGrid=grid)
+```
+
+Running this training took ~1hour (on a 2015 macbook air), and the results are summarized below:
+
+----
+Tuning parameter 'n.minobsinnode' was held constant at a value of 10
+RMSE was used to select the optimal model using  the smallest value.
+The final values used for the model were n.trees = 141, interaction.depth = 2, shrinkage = 0.1 and n.minobsinnode
+ = 10. 
+----  
+
+Now that we have tuned the gradient descent model we are in a position to make predictions. Fist we create a gradient descent model using the parameters identified above.  Note that we will use a gaussian distrubution, thus the loss function follows the methodology we outlined above.  
+
+```{r echo=TRUE}
+# create gbm model using parameter values from hypertuning
+earnings.gbm = gbm(MedianEarnings~., data=earnings.train, n.trees=141, interaction.depth=2, shrinkage=0.1, distribution="gaussian")
+```
+
+Next we use this model to make MedianEarning predictions using the test data set and we plot the test values versus the predicted values.
+
+```{r echo=TRUE}
+# make predictions on test data and plot the results
+earnings.test.predict = predict(earnings.gbm, newdata=earnings.test, n.trees=141)
+plot(earnings.test$MedianEarnings, earnings.test.predict, xlim=c(20000,70000), ylim=c(20000,70000), xlab=("MedianEarnings"), ylab=("PredictedEarnings"))
+abline(coef=c(0,1))
+```
+
+We can now calcualte the root mean squared error of the model:
+
+```{r echo=TRUE}
+# calculate RMSE for model1
+rmse.1 <- (sum((earnings.test$MedianEarnings - earnings.test.predict)^2)/nrow(earnings.test))^0.5
+rmse.1
+```
+
+
+
+We next evaluate model performance by calculating the R-squared value of the model.  The R-squared of a regression model is defined as:
+
+$\begin{align*}
+R^2 \equiv 1 - \frac{SS_{res}}{SS_{tot}}
+\end{align*}$
+
+where:
+
+$\begin{align*}
+SS_{res} = \sum_{i=1}^{n}(y_i - F(x_i))^2
+\end{align*}$
+
+and 
+
+$\begin{align*}
+SS_{tot} = \sum_{i=1}^{n}(y_i - \overline{y})^2
+\end{align*}$
+
+Based on this, we can calculate $\begin{align*} SS_{res} \end{align*}$ and $\begin{align*} SS_{tot} \end{align*}$ as shown below.
+
+```{r echo=TRUE}
+# calculate R squared
+ss.res <- sum((earnings.test$MedianEarnings - earnings.test.predict)^2)
+ss.tot <- sum((earnings.test$MedianEarnings - mean(earnings.test$MedianEarnings))^2)
+r.squared.1 = 1 - ss.res/ss.tot
+r.squared.1
+```
+
+As shown above, we find that the R-squared value for the gradient descent model is 0.62, indicating that the model explains 62% of the variability in the MedianEarnings Data.  This indicates that nearly half of the variability in the data is unexplained.  To overcome this, we will try in incorporate additional features into the model.  It is possible that certain majors produce students with higher median future salaries, and schools that have high levels of these more lucrative majors may have a higher average MedianEarnings value.  We will thus create a new model that includes information regarding the relative amounts of the fields of study of the students.  In particular, we choose to include the following features:  
+
+PCIP01, PCIP03, PCIP04, PCIP05, PCIP09, PCIP10, PCIP11, PCIP12, PCIP13 ,PCIP14, PCIP15, PCIP16, PCIP19, PCIP22, PCIP23, PCIP24, PCIP25, PCIP26, PCIP27, PCIP29, PCIP30, PCIP31, PCIP38, PCIP39, PCIP40, PCIP41, PCIP42, PCIP43, PCIP44, PCIP45,, PCIP46, PCIP47, PCIP48, PCIP49, PCIP50, PCIP51, PCIP52, PCIP54
+
+For example, PCIP01 corresponds to - Percentage of degrees awarded in Agriculture, Agriculture Operations, And Related Sciences while PCIP54 corresponds to - Percentage of degrees awarded in History.  We can now pull this data from the database.
+
+#### Model2
+
+```{r echo=TRUE, warning=FALSE}
+# pull earnings and degree data from the database
+earnings <- dbSendQuery(college.db, "SELECT PCIP01, PCIP03, PCIP04, PCIP05, PCIP09, PCIP10, PCIP11, PCIP12, PCIP13, PCIP14, PCIP15, PCIP16, PCIP19, PCIP22, PCIP23, PCIP24, PCIP25, PCIP26, PCIP27, PCIP29, PCIP30, PCIP31, PCIP38, PCIP39, PCIP40, PCIP41, PCIP42, PCIP43, PCIP44, PCIP45, PCIP46, PCIP47, PCIP48, PCIP49, PCIP50, PCIP51, PCIP52, PCIP54, HIGHDEG as [highestDegree], STABBR as [state], COSTT4_A as [averageCost], AVGFACSAL as [avgFacultySalary], SAT_AVG as [AverageSAT], MD_EARN_WNE_P10 as [MedianEarnings] FROM collegeData")
+earnings  <- fetch(earnings)
+
+# remove missing data and format as numeric
+earnings$averageCost <- as.numeric(earnings$averageCost)
+earnings$avgFacultySalary <- as.numeric(earnings$avgFacultySalary)
+earnings$AverageSAT <- as.numeric(earnings$AverageSAT)
+earnings$MedianEarnings <- as.numeric(earnings$MedianEarnings)
+earnings$state <- as.factor(earnings$state)
+earnings$highestDegree <- as.numeric(earnings$highestDegree)
+
+# convert 'highest degree' number to name
+degrees <- data.frame(number = c(0,1,2,3,4), type = c("Non-degree-granting", "Certificate degree", "Associate degree", "Bachelor's degree", "Graduate Degree"))
+earnings$highestDegree <- degrees$type[match(earnings$highestDegree, degrees$number)]
+earnings$highestDegree <- as.factor(earnings$highestDegree)
+
+# convert degree percentage data to numeric
+earnings[,1:38] <- sapply(earnings[,1:38], as.numeric)
+
+# remove missing data
+earnings <- earnings[complete.cases(earnings),]
+```
+
+We now proceed exactly as above by splitting data into test/training sets and performing hyperparameter tuning.
+
+```{r echo=TRUE, warning=FALSE}
+# split data into test and training sets
+splitter <- sample(c("train", "test"), nrow(earnings), replace=TRUE, prob=c(0.7,0.3))
+earnings.train <- earnings[splitter == 'train',]
+earnings.test <- earnings[splitter == 'test',]
+```
+
+```{r echo=TRUE, eval=TRUE}
+# hyperparameter tuning
+grid = expand.grid(.n.trees=seq(1,201, by=20), .interaction.depth=seq(1,4, by=1), .shrinkage=c(.001,.01,.1), .n.minobsinnode=10)
+```
+
+```{r echo=TRUE, eval=FALSE}
+control = trainControl(method="LOOCV")
+earnings.gbm.train = train(MedianEarnings~., data=earnings.train, method="gbm", trControl=control, tuneGrid=grid)
+```
+
+This tuning took a few hours to run, and the results are summarized below:
+
+----
+Tuning parameter 'n.minobsinnode' was held constant at a value of 10
+RMSE was used to select the optimal model using  the smallest value.
+The final values used for the model were n.trees = 141, interaction.depth = 4, shrinkage = 0.1 and n.minobsinnode = 10. 
+---- 
+
+<br>
+Interestingly, we found that the tuning parameters for the model after adding the feautures related to the percentage of degrees at an institution were different.  Specifically, we found that the interaction.depth for this tuning was 4, while previously it was 2, indicating that the model will use twice as many splits in the trees.  Finally, we can create a gbm, make predictions, and calcualte the R-squared and root mean squared error of the model as above.
+
+```{r echo=TRUE}
+# create gbm model using parameter values from hypertuning
+earnings.gbm = gbm(MedianEarnings~., data=earnings.train, n.trees=141, interaction.depth=4, shrinkage=0.1, distribution="gaussian")
+
+# make predictions on test data and plot the results
+earnings.test.predict = predict(earnings.gbm, newdata=earnings.test, n.trees=141)
+plot(earnings.test$MedianEarnings, earnings.test.predict, xlim=c(20000,70000), ylim=c(20000,70000), xlab=("MedianEarnings"), ylab=("PredictedEarnings"))
+abline(coef=c(0,1))
+
+# calculate R squared of model 2
+ss.res <- sum((earnings.test$MedianEarnings - earnings.test.predict)^2)
+ss.tot <- sum((earnings.test$MedianEarnings - mean(earnings.test$MedianEarnings))^2)
+r.squared.2 = 1 - ss.res/ss.tot
+r.squared.2
+
+# rmse
+rmse.2 <- (sum((earnings.test$MedianEarnings - earnings.test.predict)^2)/nrow(earnings.test))^0.5
+rmse.2
+```
+
+As shown above, we have significantly increased the R-squared of the model by including these additional features.  Also, we have decreased the rmse.  This is further visuablized in the table below.
+
+```{r echo=TRUE}
+# create table of R-squared and RMSE values for Model 1 and Model 2
+results.table <- data.frame(type = c("Model1", "Model2 (+ degree info)"), Rsquared = c(r.squared.1, r.squared.2), RMSE = c(rmse.1, rmse.2))
+kable(head(results.table), format="html", align = 'c',digits = 2)
+```
+
+#### Model Building Conclusions
+
+As shown above, we signficantly improved the accuracy of the model by including information pertaining to the degree types of the intsitution.  As there are 38 features related to degree types, it would be very interesting to find what degrees are related to future Median Earnings.  
+
+And, if you made it this far and you are still awake, thanks!

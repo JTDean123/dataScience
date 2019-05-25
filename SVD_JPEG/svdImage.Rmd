@@ -1,0 +1,336 @@
+---
+title: "Singular Value Decomposition of an Image"
+author: "Jason Dean"
+date: "March, 2017"
+output: html_document
+---
+
+<br>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(jpeg)
+```
+
+
+```{r echo=FALSE}
+imagematrix <- function(mat, type=NULL, ncol=dim(mat)[1], nrow=dim(mat)[2],
+                        noclipping=FALSE) {
+  if (is.null(dim(mat)) && is.null(type)) stop("Type should be specified.")
+  if (length(dim(mat)) == 2 && is.null(type)) type <- "grey"
+  if (length(dim(mat)) == 3 && is.null(type)) type <- "rgb"
+  if (type != "rgb" && type != "grey") stop("Type is incorrect.")
+  if (is.null(ncol) || is.null(nrow)) stop("Dimension is uncertain.")
+  imgdim <- c(ncol, nrow, if (type == "rgb") 3 else NULL)
+  if (length(imgdim) == 3 && type == "grey") {
+    # force to convert grey image
+    mat <- rgb2grey(mat)
+  }
+  if (noclipping == FALSE && ((min(mat) < 0) || (1 < max(mat)))) {
+    warning("Pixel values were automatically clipped because of range over.") 
+    mat <- clipping(mat)
+  }
+  mat <- array(mat, dim=imgdim)
+  attr(mat, "type") <- type
+  class(mat) <- c("imagematrix", class(mat))
+  mat
+}
+
+print.imagematrix <- function(x, ...) {
+  x.dim <- dim(x)
+  cat("size: ", x.dim[1], "x", x.dim[2], "\n")
+  cat("type: ", attr(x, "type"), "\n")
+}
+
+plot.imagematrix <- function(x, ...) {
+  colvec <- switch(attr(x, "type"),
+                grey=grey(x),
+                rgb=rgb(x[,,1], x[,,2], x[,,3]))
+  if (is.null(colvec)) stop("image matrix is broken.")
+  colors <- unique(colvec)
+  colmat <- array(match(colvec, colors), dim=dim(x)[1:2])
+  image(x = 0:(dim(colmat)[2]), y=0:(dim(colmat)[1]),
+        z = t(colmat[nrow(colmat):1, ]), col=colors,
+        xlab="", ylab="", axes=FALSE, asp=1, ...)
+}
+
+imageType <- function(x) {
+  attr(x, "type")
+}
+
+rgb2grey <- function(img, coefs=c(0.30, 0.59, 0.11)) {
+  if (is.null(dim(img))) stop("image matrix isn't correct.")
+  if (length(dim(img))<3) stop("image matrix isn't rgb image.")
+  imagematrix(coefs[1] * img[,,1] + coefs[2] * img[,,2] + coefs[3] * img[,,3],
+              type="grey")
+}
+clipping <- function(img, low=0, high=1) {
+  img[img < low] <- low
+  img[img > high] <- high
+  img
+}
+normalize <- function(img) {
+  (img - min(img))/(max(img) - min(img))
+}
+```
+
+### Singluar Value Decomposition
+
+Singular value decomposition, a method for factorization of a matrix, is one of the most useful linear algebra tools and it has many applications.  Here I will describe SVD decomposition of an image, but first some background.
+
+(Side note - you can find all of this code on my Github: https://github.com/JTDean123)
+
+SVD is the factorization of a real *m x n* matrix *A* into three vectors:  
+
+- a *m x m* matrix *U* containing the left singular vectors of *A*.  The left singular vectors of *A* are the set of orthonormal eigenvectors of *AA^T^*.
+
+- a diagonal *m x n* matrix *S* containing the non-zero singular values (the square root of the eigenvalues) of *A*.  By custom, the values of *S* are arranged in descending order.
+
+- a *n x n* matrix *U* containing the right singular vectors of *A*.  The right singular vectors of *A* are the set of orthonormal eigenvectors of *A^T^A*.
+
+Taken together, this means that *A* can be deconstructed as:
+
+- *A* = *USV^T^*
+
+OK great, but why is this useful?  This question will be easier to answer if we go through a simple example.  Consider a *4x3* matrix A that we wish to decompose with SVD:
+
+```{r echo=FALSE}
+A = matrix(nrow = 4, ncol=3)
+A[,1] <- c(4,0,2,0)
+A[,2] <- c(0,6,0,3)
+A[,3] <- c(8,1,6,0)
+```
+
+$$\mathbf{A} = \left[\begin{array}
+{rrr}
+4 & 0 & 8 \\
+0 & 6 & 1 \\
+2 & 0 & 6 \\
+0 & 3 & 0
+\end{array}\right]$$
+
+The singular value decomposition, or *A* = *USV^T^*,  (svd(A) in R) yields the following result:
+
+$$\mathbf{U} = \left[\begin{array}
+{rrr}
+0.81 & -0.10 & 0.57 \\
+0.12 & 0.89 & -0.10 \\
+0.57 & -0.06 & -0.79 \\
+0.02 & 0.45 & 0.21
+\end{array}\right]
+\mathbf{S} = \left[\begin{array}
+{rrr}
+10.99 & 0 & 0 \\
+0 & 6.69 & 0 \\
+0 & 0 & 0.752
+\end{array}\right]
+\mathbf{V} = \left[\begin{array}
+{rrr}
+0.40 & -0.08 & 0.91 \\
+0.07 & 1.0 & 0.05 \\
+0.91 & -0.04 & -0.40
+\end{array}\right]$$
+
+The first thing that we notice is that the first two singular values, 10.99 and 6.69, are > 95% of the total sum of the singular values. The magnitude of the singular values are proportional to how much information is contained in them, meaning we could reconstruct ~95% of *A* with only 2 of the 3 singular values.  Furthermore, we see that the first singular value is 60% of the total sum of the singular values.  This means, intuitively, that about two thirds of our data can be explained with one singular value.  Looking at the matrix *A* this makes sense, as columns 1 and 3 are similar.  We can quantify this by looking at the transpose of *V*:
+
+$$\mathbf{V*} = \left[\begin{array}
+{rrr}
+0.40 & 0.07 & 0.91 \\
+-0.08 & 1.0 & -0.04 \\
+0.91 & 0.05 & -0.40
+\end{array}\right]$$
+
+The first two rows are those multiplied by the first two singular values of *S*.  We see that columns 1 and 3 are very similar in these first two rows, indicating, as we can intuitively see, that columns 1 and 3 are similar.  The implications of this are quite numerous.  Imagine if the rows of matrix *A* contained customers and the columns represented movie reviews. There could be hundreds or thousands of movies, so how do we make sense of this?  Imagine that we calculate the SVD and find that 8 singular values account for 95% of the data.  This means that we have 8 different types of movies in the data, possibly corresponding to 'horror', 'action', and so on.  We can also apply this type of deconstruction to an image, and this is what I will discuss below.
+
+
+### SVD of an Image
+
+For this analysis we will use an image that I took on a recent hiking adventure to Joshua Tree National Park.  Sunny deserts are a a good place to go during the Seattle winter!  First we load the image into R and plot the original.
+
+```{r echo=TRUE}
+jTree <- readJPEG('jTree.JPG')
+plot(imagematrix(jTree))
+```
+
+Beautiful!  The image is stored as a matrix with a red, green, and blue components.  We need to decompose each color matrix separately, so before moving forward we break the image down into it's color components.  
+
+```{r echo=TRUE}
+red <- jTree[,,1]
+green <- jTree[,,2]
+blue <- jTree[,,3]
+```
+
+Now that we have the image broken down into the red, green, and blue components we can calculate the singular value decomposition.  These matrices are quite large, so this step will take some time.  
+
+```{r echo=TRUE}
+red.svd <- svd(red)
+green.svd <- svd(green)
+blue.svd <- svd(blue)
+```
+
+Great.  Now that we have determined the singular value decomposition of the color components we can visualize the singular values for the red decomposition.
+
+```{r echo=TRUE}
+plot(seq(1,length(red.svd$d)), red.svd$d, xlab="singluar value (red)", ylab="value")
+```
+
+As shown above, there are > 1200 singular values, however as we learned above only a small fraction of them contribute to their sum total value.  This is further visualized below.
+
+```{r echo=TRUE}
+redD.cdf <- ecdf(red.svd$d)
+blueD.cdf <- ecdf(blue.svd$d)
+greenD.cdf <- ecdf(green.svd$d)
+
+plot(redD.cdf,xlim=c(0,20), col='red', xlab="singluar value", ylab="cumulative fraction", main='')
+plot(blueD.cdf, add=TRUE, col='blue')
+plot(greenD.cdf, add=TRUE, col='green')
+```
+
+As shown above, we find that only about 20 singular values are needed to account for almost all of the information in the image.  This data provides a nice starting point for the number of singular values that we need to re-build our image.  We will start by reconstructing the image with one singular value.
+
+First, we create a diagonal matrix containing singular values.
+
+```{r echo=TRUE}
+red.svd$d <- diag(red.svd$d)
+green.svd$d <- diag(green.svd$d)
+blue.svd$d <- diag(blue.svd$d)
+```
+
+Next we reconstruct the image using only the first singular value.
+
+```{r echo=TRUE}
+red1D <- red.svd$d
+red1D[2:nrow(red1D),] <-0
+red1 <- red.svd$u%*%red1D%*%t(red.svd$v)
+
+blue1D <- blue.svd$d
+blue1D[2:nrow(blue1D),] <-0
+blue1 <- blue.svd$u%*%blue1D%*%t(blue.svd$v)
+
+green1D <- green.svd$d
+green1D[2:nrow(green1D),] <-0
+green1 <- green.svd$u%*%green1D%*%t(green.svd$v)
+
+```
+
+
+We next need to process the decomposed, reconstructed image using the imagematrix function.  This function was obtained here:
+<br>
+
+https://github.com/cran/ReadImages/blob/master/R/imagematrix.R
+
+
+```{r echo=TRUE}
+jTree.small <- jTree
+jTree.small[,,1] <- red1
+jTree.small[,,2] <- green1
+jTree.small[,,3] <- blue1
+
+jTree.small <- imagematrix(jTree.small)
+plot(jTree.small, useRaster=TRUE)
+```
+
+Using just one singular value we have captured some key features of the image.  Specifically, we captured the landscape break and the main color distributions.  Keep in mind this is using less than 0.1% of the singular values.  
+
+
+We next reconstruct the image using three singular values.  
+
+```{r echo=TRUE, warning=FALSE}
+
+red1D <- red.svd$d
+red1D[4:nrow(red1D),] <-0
+red1 <- red.svd$u%*%red1D%*%t(red.svd$v)
+
+blue1D <- blue.svd$d
+blue1D[4:nrow(blue1D),] <-0
+blue1 <- blue.svd$u%*%blue1D%*%t(blue.svd$v)
+
+green1D <- green.svd$d
+green1D[4:nrow(green1D),] <-0
+green1 <- green.svd$u%*%green1D%*%t(green.svd$v)
+
+jTree.small <- jTree
+jTree.small[,,1] <- red1
+jTree.small[,,2] <- green1
+jTree.small[,,3] <- blue1
+
+jTree.small <- imagematrix(jTree.small)
+plot(jTree.small, useRaster=TRUE)
+```
+
+As shown above, we now have significantly more details in the image.  We next reconstruct the image with eight singular values.......
+
+
+```{r echo=TRUE, warning=FALSE}
+
+red1D <- red.svd$d
+red1D[9:nrow(red1D),] <-0
+red1 <- red.svd$u%*%red1D%*%t(red.svd$v)
+
+blue1D <- blue.svd$d
+blue1D[9:nrow(blue1D),] <-0
+blue1 <- blue.svd$u%*%blue1D%*%t(blue.svd$v)
+
+green1D <- green.svd$d
+green1D[9:nrow(green1D),] <-0
+green1 <- green.svd$u%*%green1D%*%t(green.svd$v)
+
+jTree.small <- jTree
+jTree.small[,,1] <- red1
+jTree.small[,,2] <- green1
+jTree.small[,,3] <- blue1
+
+jTree.small <- imagematrix(jTree.small)
+plot(jTree.small, useRaster=TRUE)
+```
+
+... and with fifteen singular values.....
+
+```{r echo=TRUE, warning=FALSE}
+red1D <- red.svd$d
+red1D[16:nrow(red1D),] <-0
+red1 <- red.svd$u%*%red1D%*%t(red.svd$v)
+
+blue1D <- blue.svd$d
+blue1D[16:nrow(blue1D),] <-0
+blue1 <- blue.svd$u%*%blue1D%*%t(blue.svd$v)
+
+green1D <- green.svd$d
+green1D[16:nrow(green1D),] <-0
+green1 <- green.svd$u%*%green1D%*%t(green.svd$v)
+
+jTree.small <- jTree
+jTree.small[,,1] <- red1
+jTree.small[,,2] <- green1
+jTree.small[,,3] <- blue1
+
+jTree.small <- imagematrix(jTree.small)
+plot(jTree.small, useRaster=TRUE)
+```
+
+.... and finally with 100 singular values.  
+
+
+```{r echo=TRUE, warning=FALSE}
+red1D <- red.svd$d
+red1D[101:nrow(red1D),] <-0
+red1 <- red.svd$u%*%red1D%*%t(red.svd$v)
+
+blue1D <- blue.svd$d
+blue1D[101:nrow(blue1D),] <-0
+blue1 <- blue.svd$u%*%blue1D%*%t(blue.svd$v)
+
+green1D <- green.svd$d
+green1D[101:nrow(green1D),] <-0
+green1 <- green.svd$u%*%green1D%*%t(green.svd$v)
+
+jTree.small <- jTree
+jTree.small[,,1] <- red1
+jTree.small[,,2] <- green1
+jTree.small[,,3] <- blue1
+
+jTree.small <- imagematrix(jTree.small)
+plot(jTree.small, useRaster=TRUE)
+```
+
+Looking pretty good!  Using just 10% of the singular values we have reconstructed our image very nicely.  
