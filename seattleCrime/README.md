@@ -10,5 +10,3 @@ Included files:
 
 CrimeLocs - .csv file containing data used for Tableau analysis  
 seattleCrime.twb - Tableau project  
-
-Please check jasontdean.com for more details.
